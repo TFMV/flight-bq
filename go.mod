@@ -4,12 +4,11 @@ go 1.26.1
 
 require (
 	github.com/apache/arrow-adbc/go/adbc v1.10.0
-	github.com/apache/arrow/go/v18 v18.0.0-20241007013041-ab95a4d25142
+	github.com/apache/arrow-go/v18 v18.5.0
 	google.golang.org/grpc v1.79.3
 )
 
 require (
-	github.com/apache/arrow-go/v18 v18.5.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/goccy/go-json v0.10.5 // indirect
 	github.com/google/flatbuffers v25.9.23+incompatible // indirect

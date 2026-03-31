@@ -3,312 +3,391 @@ package server
 import (
 	"context"
 	"fmt"
-	"log"
-	"sync"
 	"time"
 
+	"github.com/TFMV/flight-bq/internal/bridge"
+	"github.com/TFMV/flight-bq/internal/observability"
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 )
 
+// FlightSQLServer is an enterprise-grade Flight SQL server backed by ADBC.
 type FlightSQLServer struct {
 	flightsql.BaseServer
 
-	driver     adbc.Driver
-	driverOpts map[string]string
+	config   ServerConfig
+	logger   observability.Logger
+	metrics  observability.MetricsHook
 
-	mu          sync.RWMutex
-	sessions    map[string]*Session
-	sessionCond *sync.Cond
-
-	queryHandles map[string]stmtHandle
-	handleTTL    time.Duration
+	sessions *SessionManager
+	handles  *HandleStore
 }
 
-type stmtHandle struct {
-	sql     string
-	expires time.Time
-}
-
-func (h stmtHandle) isExpired() bool { return time.Now().After(h.expires) }
-
-func newQueryHandle() string {
-	b := make([]byte, 16)
-	for i := range b {
-		b[i] = byte((i*73 + 13) % 256)
-	}
-	return fmt.Sprintf("%x", b)
-}
-
-type Session struct {
-	id        string
-	conn      adbc.Connection
-	db        adbc.Database
-	createdAt time.Time
-	queries   int64
-	mu        sync.Mutex
-	inUse     bool
-}
-
+// NewFlightSQLServer creates a server with default config and no-op observability.
 func NewFlightSQLServer() (*FlightSQLServer, error) {
-	return NewFlightSQLServerWithDriver(nil, nil)
+	return NewFlightSQLServerWithConfig(nil, nil, DefaultConfig(), observability.NopLogger{}, observability.NopMetrics{})
 }
 
+// NewFlightSQLServerWithDriver creates a server with the given driver and options.
+// Preserves the original constructor signature for backward compatibility.
 func NewFlightSQLServerWithDriver(driver adbc.Driver, driverOpts map[string]string) (*FlightSQLServer, error) {
+	return NewFlightSQLServerWithConfig(driver, driverOpts, DefaultConfig(), observability.NopLogger{}, observability.NopMetrics{})
+}
+
+// NewFlightSQLServerWithConfig creates a fully configured Flight SQL server.
+func NewFlightSQLServerWithConfig(
+	driver adbc.Driver,
+	driverOpts map[string]string,
+	config ServerConfig,
+	logger observability.Logger,
+	metrics observability.MetricsHook,
+) (*FlightSQLServer, error) {
+	baseOpts := config.BigQuery.ToMap()
+	if driverOpts == nil {
+		driverOpts = baseOpts
+	} else {
+		for k, v := range baseOpts {
+			if _, exists := driverOpts[k]; !exists {
+				driverOpts[k] = v
+			}
+		}
+	}
+	if logger == nil {
+		logger = observability.NopLogger{}
+	}
+	if metrics == nil {
+		metrics = observability.NopMetrics{}
+	}
+
 	s := &FlightSQLServer{
-		sessions:     make(map[string]*Session),
-		driverOpts:   make(map[string]string),
-		queryHandles: make(map[string]stmtHandle),
-		handleTTL:    30 * time.Minute,
+		config:   config,
+		logger:   logger,
+		metrics:  metrics,
+		sessions: NewSessionManager(driver, driverOpts, config, logger, metrics),
+		handles:  NewHandleStore(config, logger),
 	}
-	if driver != nil {
-		s.driver = driver
-	}
-	if driverOpts != nil {
-		s.driverOpts = driverOpts
-	}
-	s.sessionCond = sync.NewCond(&s.mu)
 	return s, nil
 }
 
+// SetDriverOptions updates the driver options. Must be called before Start.
 func (s *FlightSQLServer) SetDriverOptions(opts map[string]string) {
-	s.driverOpts = opts
+	s.sessions.driverOpts = opts
 }
 
-func (s *FlightSQLServer) getOrCreateSession(ctx context.Context, sessionID string) (*Session, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if session, exists := s.sessions[sessionID]; exists {
-		session.mu.Lock()
-		if session.conn != nil {
-			session.queries++
-			session.mu.Unlock()
-			return session, nil
-		}
-		session.mu.Unlock()
-	}
-
-	db, err := s.driver.NewDatabase(s.driverOpts)
-	if err != nil {
-		return nil, err
-	}
-
-	conn, err := db.Open(ctx)
-	if err != nil {
-		db.Close()
-		return nil, err
-	}
-
-	session := &Session{
-		id:        sessionID,
-		conn:      conn,
-		db:        db,
-		createdAt: time.Now(),
-		queries:   1,
-		inUse:     true,
-	}
-	s.sessions[sessionID] = session
-	return session, nil
+// Start launches background goroutines (session cleanup, handle cleanup).
+func (s *FlightSQLServer) Start() {
+	s.sessions.Start()
+	s.handles.Start()
+	s.logger.Info("flight sql server started",
+		"max_sessions", s.config.MaxSessions,
+		"session_ttl", s.config.SessionTTL,
+		"stream_buffer", s.config.StreamBufferSize,
+	)
 }
 
-func (s *FlightSQLServer) closeSessionInternal(ctx context.Context, sessionID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	session, exists := s.sessions[sessionID]
-	if !exists {
-		return nil
-	}
-
-	session.mu.Lock()
-	defer session.mu.Unlock()
-
-	if session.conn != nil {
-		session.conn.Close()
-		session.conn = nil
-	}
-	if session.db != nil {
-		session.db.Close()
-		session.db = nil
-	}
-	delete(s.sessions, sessionID)
-	return nil
-}
-
+// Shutdown stops background goroutines and closes all sessions.
 func (s *FlightSQLServer) Shutdown() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var errs []error
-	for id, session := range s.sessions {
-		session.mu.Lock()
-		if session.conn != nil {
-			if err := session.conn.Close(); err != nil {
-				errs = append(errs, err)
-			}
-		}
-		if session.db != nil {
-			if err := session.db.Close(); err != nil {
-				errs = append(errs, err)
-			}
-		}
-		session.mu.Unlock()
-		delete(s.sessions, id)
-	}
-
-	if len(errs) > 0 {
-		return errs[0]
-	}
-	return nil
+	s.handles.Stop()
+	err := s.sessions.Shutdown()
+	s.logger.Info("flight sql server shut down")
+	return err
 }
 
+// ---------------------------------------------------------------------------
+// FlightSQL: Statement Query
+// ---------------------------------------------------------------------------
+
+// GetFlightInfoStatement handles the first phase of a query: registering the
+// query and returning a ticket for DoGet.
 func (s *FlightSQLServer) GetFlightInfoStatement(ctx context.Context, cmd flightsql.StatementQuery, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
 	query := cmd.GetQuery()
 	if query == "" {
-		return nil, fmt.Errorf("empty query")
+		return nil, ErrEmptyQuery
 	}
 
-	handle := newQueryHandle()
-
-	s.mu.Lock()
-	s.queryHandles[handle] = stmtHandle{
-		sql:     query,
-		expires: time.Now().Add(s.handleTTL),
+	handle, err := s.handles.NewHandle(query)
+	if err != nil {
+		return nil, WrapError("get-flight-info", err)
 	}
-	s.mu.Unlock()
 
 	ticketBytes, err := flightsql.CreateStatementQueryTicket([]byte(handle))
 	if err != nil {
-		return nil, fmt.Errorf("create ticket: %w", err)
-	}
-
-	endpoint := &flight.FlightEndpoint{
-		Ticket: &flight.Ticket{
-			Ticket: ticketBytes,
-		},
+		return nil, WrapError("create-ticket", err)
 	}
 
 	return &flight.FlightInfo{
 		FlightDescriptor: desc,
-		Endpoint:         []*flight.FlightEndpoint{endpoint},
-		TotalRecords:     -1,
-		TotalBytes:       -1,
+		Endpoint: []*flight.FlightEndpoint{{
+			Ticket: &flight.Ticket{Ticket: ticketBytes},
+		}},
+		TotalRecords: -1,
+		TotalBytes:   -1,
 	}, nil
 }
 
+// DoGetStatement handles the second phase: executing the query and streaming results.
 func (s *FlightSQLServer) DoGetStatement(ctx context.Context, ticket flightsql.StatementQueryTicket) (*arrow.Schema, <-chan flight.StreamChunk, error) {
 	handle := string(ticket.GetStatementHandle())
+	queryID := observability.NewQueryID()
 
-	s.mu.Lock()
-	h, ok := s.queryHandles[handle]
-	if ok {
-		delete(s.queryHandles, handle)
-	}
-	s.mu.Unlock()
-
-	if !ok {
-		return nil, nil, fmt.Errorf("statement handle not found")
-	}
-	if h.isExpired() {
-		return nil, nil, fmt.Errorf("statement handle expired")
+	// Consume the handle (one-time use).
+	query, err := s.handles.ConsumeHandle(handle)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	query := h.sql
+	s.logger.Info("query starting", "query_id", queryID, "sql", truncateSQL(query))
+	s.metrics.OnQueryStart(queryID, query)
 	startTime := time.Now()
-	queryID := query
-	if len(queryID) > 8 {
-		queryID = queryID[:8]
-	}
 
-	log.Printf("[%s] Starting query execution", queryID)
-
-	session, err := s.getOrCreateSession(ctx, "default")
+	// Get a session.
+	session, err := s.sessions.GetSession(ctx, "default")
 	if err != nil {
-		log.Printf("[%s] Failed to get session: %v", queryID, err)
+		s.logger.Error("session acquire failed", "query_id", queryID, "error", err)
+		s.metrics.OnQueryError(queryID, err)
 		return nil, nil, err
 	}
 
-	stmt, err := session.conn.NewStatement()
+	// Create and execute statement.
+	stmt, err := NewStatement(session.conn, query)
 	if err != nil {
-		log.Printf("[%s] Failed to create statement: %v", queryID, err)
+		s.sessions.ReleaseSession("default")
+		s.logger.Error("statement creation failed", "query_id", queryID, "error", err)
+		s.metrics.OnQueryError(queryID, err)
 		return nil, nil, err
 	}
 
-	if err := stmt.SetSqlQuery(query); err != nil {
-		log.Printf("[%s] Failed to set query: %v", queryID, err)
+	rdr, _, err := stmt.Execute(ctx)
+	if err != nil {
 		stmt.Close()
+		s.sessions.ReleaseSession("default")
+		s.logger.Error("query execution failed", "query_id", queryID, "error", err)
+		s.metrics.OnQueryError(queryID, err)
 		return nil, nil, err
 	}
 
-	rdr, rowsAffected, err := stmt.ExecuteQuery(ctx)
-	if err != nil {
-		log.Printf("[%s] ExecuteQuery failed: %v", queryID, err)
-		stmt.Close()
-		return nil, nil, err
-	}
+	schema := rdr.Schema()
+	ch := make(chan flight.StreamChunk, s.config.StreamBufferSize)
 
-	log.Printf("[%s] Query started, rows affected: %d, time: %v", queryID, rowsAffected, time.Since(startTime))
-
-	ch := make(chan flight.StreamChunk, 16)
-
+	// Stream in background goroutine.
 	go func() {
 		defer stmt.Close()
+		defer s.sessions.ReleaseSession("default")
 
+		firstBatchSent := false
 		rowsStreamed := int64(0)
-		for rdr.Next() {
-			select {
-			case <-ctx.Done():
-				log.Printf("[%s] Context cancelled, rows streamed: %d", queryID, rowsStreamed)
-				ch <- flight.StreamChunk{Err: ctx.Err()}
-				return
-			default:
-			}
 
-			rec := rdr.Record()
-			rec.Retain()
-			rowsStreamed += rec.NumRows()
-
-			ch <- flight.StreamChunk{
-				Data: rec,
-			}
-		}
-
-		if err := rdr.Err(); err != nil {
-			log.Printf("[%s] RecordReader error: %v", queryID, err)
-			ch <- flight.StreamChunk{Err: err}
-		} else {
-			log.Printf("[%s] Query complete, total rows: %d, time: %v", queryID, rowsStreamed, time.Since(startTime))
-		}
-		rdr.Release()
-		close(ch)
+		bridge.RecordReaderToStreamWithHooks(ctx, rdr, ch, s.config.StreamBufferSize,
+			func(rows int64) {
+				rowsStreamed += rows
+				if !firstBatchSent {
+					firstBatchSent = true
+					s.metrics.OnFirstBatch(queryID, time.Since(startTime))
+				}
+			},
+			func(err error) {
+				if err != nil {
+					s.logger.Error("query streaming error", "query_id", queryID, "error", err)
+					s.metrics.OnQueryError(queryID, err)
+				} else {
+					s.logger.Info("query complete", "query_id", queryID, "rows", rowsStreamed, "duration", time.Since(startTime))
+					s.metrics.OnQueryComplete(observability.QueryMetrics{
+						QueryID:      queryID,
+						SQL:          query,
+						Duration:     time.Since(startTime),
+						RowsStreamed: rowsStreamed,
+					})
+				}
+			},
+		)
 	}()
 
-	return rdr.Schema(), ch, nil
+	return schema, ch, nil
 }
 
-func (s *FlightSQLServer) BeginTransaction(ctx context.Context, req flightsql.ActionBeginTransactionRequest) ([]byte, error) {
-	sessionID := "txn-" + time.Now().Format("20060102150405")
+// ---------------------------------------------------------------------------
+// FlightSQL: Prepared Statements
+// ---------------------------------------------------------------------------
 
-	_, err := s.getOrCreateSession(ctx, sessionID)
-	if err != nil {
-		return nil, err
+// CreatePreparedStatement creates a reusable prepared statement.
+func (s *FlightSQLServer) CreatePreparedStatement(ctx context.Context, req flightsql.ActionCreatePreparedStatementRequest) (flightsql.ActionCreatePreparedStatementResult, error) {
+	query := req.GetQuery()
+	if query == "" {
+		return flightsql.ActionCreatePreparedStatementResult{}, ErrEmptyQuery
 	}
 
-	return []byte(sessionID), nil
+	session, err := s.sessions.GetSession(ctx, "default")
+	if err != nil {
+		return flightsql.ActionCreatePreparedStatementResult{}, WrapError("create-prepared-stmt", err)
+	}
+
+	// Create the ADBC statement and set the query.
+	adbcStmt, err := session.conn.NewStatement()
+	if err != nil {
+		s.sessions.ReleaseSession("default")
+		return flightsql.ActionCreatePreparedStatementResult{}, WrapError("create-prepared-stmt", err)
+	}
+
+	if err := adbcStmt.SetSqlQuery(query); err != nil {
+		adbcStmt.Close()
+		s.sessions.ReleaseSession("default")
+		return flightsql.ActionCreatePreparedStatementResult{}, WrapError("create-prepared-stmt", err)
+	}
+
+	// Store the handle so we can retrieve the statement later.
+	handle, err := s.handles.NewHandle(query)
+	if err != nil {
+		adbcStmt.Close()
+		s.sessions.ReleaseSession("default")
+		return flightsql.ActionCreatePreparedStatementResult{}, WrapError("create-prepared-stmt", err)
+	}
+
+	s.sessions.ReleaseSession("default")
+	s.logger.Info("prepared statement created", "handle", handle[:8])
+
+	return flightsql.ActionCreatePreparedStatementResult{
+		Handle: []byte(handle),
+	}, nil
 }
 
-func (s *FlightSQLServer) EndTransaction(ctx context.Context, req flightsql.ActionEndTransactionRequest) error {
-	sessionID := string(req.GetTransactionId())
-	return s.closeSessionInternal(ctx, sessionID)
-}
-
+// ClosePreparedStatement closes a previously created prepared statement.
 func (s *FlightSQLServer) ClosePreparedStatement(ctx context.Context, req flightsql.ActionClosePreparedStatementRequest) error {
+	handle := string(req.GetPreparedStatementHandle())
+	// Consume the handle to remove it; ignore not-found since the statement
+	// may have already been consumed via execution.
+	_, _ = s.handles.ConsumeHandle(handle)
+	s.logger.Info("prepared statement closed", "handle", truncateSQL(handle))
 	return nil
 }
 
-func (s *FlightSQLServer) CreatePreparedStatement(ctx context.Context, req flightsql.ActionCreatePreparedStatementRequest) (flightsql.ActionCreatePreparedStatementResult, error) {
-	return flightsql.ActionCreatePreparedStatementResult{}, nil
+// ---------------------------------------------------------------------------
+// FlightSQL: Transactions
+// ---------------------------------------------------------------------------
+
+// BeginTransaction starts a new transaction by creating a dedicated session.
+func (s *FlightSQLServer) BeginTransaction(ctx context.Context, req flightsql.ActionBeginTransactionRequest) ([]byte, error) {
+	queryID := observability.NewQueryID()
+	sessionID := "txn-" + queryID
+
+	_, err := s.sessions.GetSession(ctx, sessionID)
+	if err != nil {
+		return nil, WrapError("begin-transaction", err)
+	}
+
+	s.logger.Info("transaction started", "session_id", sessionID)
+	return []byte(sessionID), nil
+}
+
+// EndTransaction commits or rolls back a transaction and closes its session.
+func (s *FlightSQLServer) EndTransaction(ctx context.Context, req flightsql.ActionEndTransactionRequest) error {
+	sessionID := string(req.GetTransactionId())
+	s.logger.Info("transaction ended", "session_id", sessionID)
+	return s.sessions.CloseSession(ctx, sessionID)
+}
+
+// ---------------------------------------------------------------------------
+// FlightSQL: Metadata APIs
+// ---------------------------------------------------------------------------
+
+// GetFlightInfoCatalogs returns flight info for catalog listing.
+func (s *FlightSQLServer) GetFlightInfoCatalogs(ctx context.Context, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
+	handle, err := s.handles.NewHandle("__catalogs__")
+	if err != nil {
+		return nil, WrapError("get-catalogs-info", err)
+	}
+
+	ticketBytes, err := flightsql.CreateStatementQueryTicket([]byte(handle))
+	if err != nil {
+		return nil, WrapError("create-ticket", err)
+	}
+
+	return &flight.FlightInfo{
+		FlightDescriptor: desc,
+		Endpoint: []*flight.FlightEndpoint{{
+			Ticket: &flight.Ticket{Ticket: ticketBytes},
+		}},
+		TotalRecords: -1,
+		TotalBytes:   -1,
+	}, nil
+}
+
+// GetFlightInfoSchemas returns flight info for schema listing.
+func (s *FlightSQLServer) GetFlightInfoSchemas(ctx context.Context, cmd flightsql.GetDBSchemas, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
+	catalog := ""
+	if cmd.GetCatalog() != nil {
+		catalog = *cmd.GetCatalog()
+	}
+	schemaPattern := ""
+	if sp := cmd.GetDBSchemaFilterPattern(); sp != nil {
+		schemaPattern = *sp
+	}
+	query := fmt.Sprintf("__schemas__%s__%s", catalog, schemaPattern)
+
+	handle, err := s.handles.NewHandle(query)
+	if err != nil {
+		return nil, WrapError("get-schemas-info", err)
+	}
+
+	ticketBytes, err := flightsql.CreateStatementQueryTicket([]byte(handle))
+	if err != nil {
+		return nil, WrapError("create-ticket", err)
+	}
+
+	return &flight.FlightInfo{
+		FlightDescriptor: desc,
+		Endpoint: []*flight.FlightEndpoint{{
+			Ticket: &flight.Ticket{Ticket: ticketBytes},
+		}},
+		TotalRecords: -1,
+		TotalBytes:   -1,
+	}, nil
+}
+
+// GetFlightInfoTables returns flight info for table listing.
+func (s *FlightSQLServer) GetFlightInfoTables(ctx context.Context, cmd flightsql.GetTables, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
+	catalog := ""
+	if cmd.GetCatalog() != nil {
+		catalog = *cmd.GetCatalog()
+	}
+	schemaPattern := ""
+	if sp := cmd.GetDBSchemaFilterPattern(); sp != nil {
+		schemaPattern = *sp
+	}
+	tablePattern := ""
+	if tp := cmd.GetTableNameFilterPattern(); tp != nil {
+		tablePattern = *tp
+	}
+	query := fmt.Sprintf("__tables__%s__%s__%s", catalog, schemaPattern, tablePattern)
+
+	handle, err := s.handles.NewHandle(query)
+	if err != nil {
+		return nil, WrapError("get-tables-info", err)
+	}
+
+	ticketBytes, err := flightsql.CreateStatementQueryTicket([]byte(handle))
+	if err != nil {
+		return nil, WrapError("create-ticket", err)
+	}
+
+	return &flight.FlightInfo{
+		FlightDescriptor: desc,
+		Endpoint: []*flight.FlightEndpoint{{
+			Ticket: &flight.Ticket{Ticket: ticketBytes},
+		}},
+		TotalRecords: -1,
+		TotalBytes:   -1,
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+func truncateSQL(sql string) string {
+	if len(sql) > 64 {
+		return sql[:64] + "..."
+	}
+	return sql
 }

@@ -3,7 +3,11 @@ package main
 import (
 	"log"
 	"net"
+	"os"
+	"os/signal"
+	"syscall"
 
+	"github.com/TFMV/flight-bq/internal/observability"
 	"github.com/TFMV/flight-bq/internal/server"
 	"github.com/apache/arrow-adbc/go/adbc/drivermgr"
 	"github.com/apache/arrow-go/v18/arrow/flight"
@@ -20,16 +24,38 @@ func main() {
 	grpcServer := grpc.NewServer()
 
 	var drv drivermgr.Driver
-	svc, err := server.NewFlightSQLServerWithDriver(&drv, map[string]string{
-		"driver":                       "bigquery",
-		"adbc.bigquery.sql.project_id": "tfmv-371720",
-	})
+	logger := observability.StdLogger{}
+	config := server.DefaultConfig()
+	config.BigQuery.ProjectID = "tfmv-371720"
+	config.BigQuery.AuthType = server.AuthTypeDefault
+
+	svc, err := server.NewFlightSQLServerWithConfig(
+		&drv,
+		nil,
+		config,
+		logger,
+		observability.NopMetrics{},
+	)
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	svc.Start()
+
 	flightServer := flightsql.NewFlightServer(svc)
 	flight.RegisterFlightServiceServer(grpcServer, flightServer)
+
+	// Graceful shutdown on SIGINT/SIGTERM.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		log.Printf("Received signal %v, shutting down...", sig)
+		grpcServer.GracefulStop()
+		if err := svc.Shutdown(); err != nil {
+			log.Printf("Shutdown error: %v", err)
+		}
+	}()
 
 	log.Println("FlightSQL server listening on :32010")
 	log.Fatal(grpcServer.Serve(lis))
